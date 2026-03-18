@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# Audit logs
+audit_log.jsonl
+
 # Virtual environments
 venv/
 env/
