@@ -14,19 +14,17 @@ Created: March 19, 2026
 """
 
 import os
-import sys
 import re
 import json
 import logging
-from typing import TypedDict, Literal, Final, Optional
-from dataclasses import dataclass, field, asdict
+from typing import TypedDict, Final
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from uuid import uuid4
 
 import yaml
 from dotenv import load_dotenv
-from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage
+from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 
@@ -45,12 +43,13 @@ logger = logging.getLogger(__name__)
 
 VALID_ROUTES = {"orders", "billing", "technical", "subscription", "general"}
 
-# Injection pattern detection
-INJECTION_PATTERNS = [
-    r"(\b(DROP|DELETE|UPDATE|INSERT|CREATE|ALTER|TRUNCATE|EXEC|EXECUTE)\b)",  # SQL injection
-    r"(\bscript\b.*\bon\w+\b)",  # JavaScript injection
-    r"(\$\{.*?\})",  # Template injection
-    r"(\.\.\/)",  # Path traversal
+# Prompt injection pattern detection (from assignment)
+INJECTION_PATTERNS: Final[list[str]] = [
+    r"ignore (your |all |previous )?instructions",
+    r"system prompt.*disabled",
+    r"you are now a",
+    r"repeat.*system prompt",
+    r"jailbreak",
 ]
 
 # Token pricing per request (mocked for demo)
@@ -80,8 +79,19 @@ class AgentHandoff:
 
     from_agent: str
     to_agent: str
-    context: str
-    metadata: dict = field(default_factory=dict)
+    task: str
+    context: dict
+    priority: str  # "low" | "normal" | "high"
+    timestamp: str
+
+    def to_prompt_context(self) -> str:
+        return (
+            f"HANDOFF FROM {self.from_agent.upper()} TO {self.to_agent.upper()}:\n"
+            f"Task: {self.task}\n"
+            f"Priority: {self.priority}\n"
+            f"Context: {self.context}\n"
+            f"Received at: {self.timestamp}"
+        )
 
 
 @dataclass
@@ -92,23 +102,28 @@ class SessionAuditLog:
     events: list = field(default_factory=list)
     total_cost_usd: float = 0.0
 
-    def log(self, event: dict):
+    def log(
+        self, agent: str, action: str, tokens_in: int = 0, tokens_out: int = 0
+    ) -> None:
         """Log an event and update cost."""
-        self.events.append({"timestamp": datetime.now().isoformat(), **event})
-
-    def add_cost(self, agent: str, input_tokens: int, output_tokens: int):
-        """Add cost for an agent call (mocked pricing)."""
-        # Mocked pricing: $0.0001 per token
-        cost = (input_tokens + output_tokens) * 0.000001
+        cost = (tokens_in * 0.000015 + tokens_out * 0.00006) / 1000
         self.total_cost_usd += cost
-        self.log(
+        self.events.append(
             {
+                "timestamp": datetime.utcnow().isoformat(),
                 "agent": agent,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cost_usd": cost,
+                "action": action,
+                "cost_usd": round(cost, 6),
             }
         )
+
+    def to_dict(self) -> dict:
+        """Convert audit log to dictionary."""
+        return {
+            "session_id": self.session_id,
+            "total_cost_usd": round(self.total_cost_usd, 6),
+            "events": self.events,
+        }
 
 
 # ============================================================================
@@ -124,13 +139,15 @@ def detect_injection(text: str) -> bool:
     return False
 
 
-def guard_request(request: str) -> tuple[bool, Optional[str]]:
-    """Guard against injection attacks. Returns (is_safe, error_message)."""
+def guard_request(request: str) -> str:
+    """Guard against injection attacks. Returns safe request or error message."""
     if detect_injection(request):
-        error = f"[SECURITY] Injection detected. Request blocked."
+        error_msg = (
+            "I can only assist with account and order support. (Request blocked.)"
+        )
         logger.warning(f"Injection attempt detected in request: {request[:100]}")
-        return False, error
-    return True, None
+        return error_msg
+    return request
 
 
 # ============================================================================
@@ -177,7 +194,7 @@ def get_llm() -> ChatOpenAI:
 # ============================================================================
 
 
-def supervisor_node(state: MultiAgentState, audit: SessionAuditLog) -> MultiAgentState:
+def supervisor_node(state: MultiAgentState, audit: SessionAuditLog) -> dict:
     """Supervisor node: Classify request and route to appropriate specialist."""
     logger.info(f"[SUPERVISOR] Processing: {state['user_request'][:50]}...")
 
@@ -185,35 +202,46 @@ def supervisor_node(state: MultiAgentState, audit: SessionAuditLog) -> MultiAgen
     supervisor_prompt = load_supervisor_prompt()
 
     # Create messages for supervisor
-    system_msg = SystemMessage(content=supervisor_prompt)
-    human_msg = HumanMessage(content=f"Classify this request: {state['user_request']}")
+    messages = [
+        SystemMessage(content=supervisor_prompt),
+        HumanMessage(content=state["user_request"]),
+    ]
 
     # Get classification
-    response = llm.invoke([system_msg, human_msg])
-    classification = response.content.strip().lower()
+    response = llm.invoke(messages)
+    route = response.content.strip().lower()
 
     # Validate classification
-    if classification not in VALID_ROUTES:
-        classification = "general"
+    if route not in VALID_ROUTES:
+        route = "general"
 
-    # Log and update cost
-    audit.add_cost(
-        "supervisor",
-        input_tokens=PRICING["supervisor"]["input_tokens"],
-        output_tokens=PRICING["supervisor"]["output_tokens"],
+    # Log supervisor action
+    audit.log(
+        agent="supervisor",
+        action=f"classified as {route}",
+        tokens_in=PRICING["supervisor"]["input_tokens"],
+        tokens_out=PRICING["supervisor"]["output_tokens"],
     )
 
-    logger.info(f"[SUPERVISOR] Classified as: {classification}")
+    logger.info(f"[SUPERVISOR] Classified as: {route}")
 
-    state["route"] = classification
-    return state
+    return {"route": route}
 
 
-def orders_agent_node(
-    state: MultiAgentState, audit: SessionAuditLog
-) -> MultiAgentState:
+def orders_agent_node(state: MultiAgentState, audit: SessionAuditLog) -> dict:
     """Orders specialist agent."""
     logger.info(f"[ORDERS AGENT] Handling: {state['user_request'][:50]}...")
+
+    # Create a structured handoff from supervisor to this specialist
+    handoff = AgentHandoff(
+        from_agent="supervisor",
+        to_agent="orders_agent",
+        task=state["user_request"],
+        context={"route": state["route"]},
+        priority="normal",
+        timestamp=datetime.utcnow().isoformat(),
+    )
+    logger.info(f"[HANDOFF] {handoff.to_prompt_context()}")
 
     llm = get_llm()
     system_prompt = """You are an orders specialist agent. Handle inquiries about:
@@ -231,20 +259,20 @@ def orders_agent_node(
         ]
     )
 
-    audit.add_cost(
-        "specialist",
-        input_tokens=PRICING["specialist"]["input_tokens"],
-        output_tokens=PRICING["specialist"]["output_tokens"],
+    audit.log(
+        agent="orders_agent",
+        action="handled order request",
+        tokens_in=PRICING["specialist"]["input_tokens"],
+        tokens_out=PRICING["specialist"]["output_tokens"],
     )
 
-    state["agent_used"] = "orders_agent"
-    state["specialist_result"] = response.content
-    return state
+    return {
+        "agent_used": "orders_agent",
+        "specialist_result": response.content,
+    }
 
 
-def billing_agent_node(
-    state: MultiAgentState, audit: SessionAuditLog
-) -> MultiAgentState:
+def billing_agent_node(state: MultiAgentState, audit: SessionAuditLog) -> dict:
     """Billing specialist agent."""
     logger.info(f"[BILLING AGENT] Handling: {state['user_request'][:50]}...")
 
@@ -264,20 +292,20 @@ def billing_agent_node(
         ]
     )
 
-    audit.add_cost(
-        "specialist",
-        input_tokens=PRICING["specialist"]["input_tokens"],
-        output_tokens=PRICING["specialist"]["output_tokens"],
+    audit.log(
+        agent="billing_agent",
+        action="handled billing request",
+        tokens_in=PRICING["specialist"]["input_tokens"],
+        tokens_out=PRICING["specialist"]["output_tokens"],
     )
 
-    state["agent_used"] = "billing_agent"
-    state["specialist_result"] = response.content
-    return state
+    return {
+        "agent_used": "billing_agent",
+        "specialist_result": response.content,
+    }
 
 
-def technical_agent_node(
-    state: MultiAgentState, audit: SessionAuditLog
-) -> MultiAgentState:
+def technical_agent_node(state: MultiAgentState, audit: SessionAuditLog) -> dict:
     """Technical support specialist agent."""
     logger.info(f"[TECHNICAL AGENT] Handling: {state['user_request'][:50]}...")
 
@@ -297,20 +325,20 @@ def technical_agent_node(
         ]
     )
 
-    audit.add_cost(
-        "specialist",
-        input_tokens=PRICING["specialist"]["input_tokens"],
-        output_tokens=PRICING["specialist"]["output_tokens"],
+    audit.log(
+        agent="technical_agent",
+        action="handled technical request",
+        tokens_in=PRICING["specialist"]["input_tokens"],
+        tokens_out=PRICING["specialist"]["output_tokens"],
     )
 
-    state["agent_used"] = "technical_agent"
-    state["specialist_result"] = response.content
-    return state
+    return {
+        "agent_used": "technical_agent",
+        "specialist_result": response.content,
+    }
 
 
-def subscription_agent_node(
-    state: MultiAgentState, audit: SessionAuditLog
-) -> MultiAgentState:
+def subscription_agent_node(state: MultiAgentState, audit: SessionAuditLog) -> dict:
     """Subscription specialist agent."""
     logger.info(f"[SUBSCRIPTION AGENT] Handling: {state['user_request'][:50]}...")
 
@@ -330,20 +358,20 @@ def subscription_agent_node(
         ]
     )
 
-    audit.add_cost(
-        "specialist",
-        input_tokens=PRICING["specialist"]["input_tokens"],
-        output_tokens=PRICING["specialist"]["output_tokens"],
+    audit.log(
+        agent="subscription_agent",
+        action="handled subscription request",
+        tokens_in=PRICING["specialist"]["input_tokens"],
+        tokens_out=PRICING["specialist"]["output_tokens"],
     )
 
-    state["agent_used"] = "subscription_agent"
-    state["specialist_result"] = response.content
-    return state
+    return {
+        "agent_used": "subscription_agent",
+        "specialist_result": response.content,
+    }
 
 
-def general_agent_node(
-    state: MultiAgentState, audit: SessionAuditLog
-) -> MultiAgentState:
+def general_agent_node(state: MultiAgentState, audit: SessionAuditLog) -> dict:
     """General fallback agent for unclassified requests."""
     logger.info(f"[GENERAL AGENT] Handling: {state['user_request'][:50]}...")
 
@@ -358,32 +386,31 @@ def general_agent_node(
         ]
     )
 
-    audit.add_cost(
-        "specialist",
-        input_tokens=PRICING["specialist"]["input_tokens"],
-        output_tokens=PRICING["specialist"]["output_tokens"],
+    audit.log(
+        agent="general_agent",
+        action="handled general request",
+        tokens_in=PRICING["specialist"]["input_tokens"],
+        tokens_out=PRICING["specialist"]["output_tokens"],
     )
 
-    state["agent_used"] = "general_agent"
-    state["specialist_result"] = response.content
-    return state
+    return {
+        "agent_used": "general_agent",
+        "specialist_result": response.content,
+    }
 
 
-def synthesize_response_node(
-    state: MultiAgentState, audit: SessionAuditLog
-) -> MultiAgentState:
+def synthesize_response_node(state: MultiAgentState, audit: SessionAuditLog) -> dict:
     """Synthesize final response from specialist result."""
     logger.info("[SYNTHESIZER] Creating final response...")
 
     # Format final response
-    final_response = f"""
-[Customer Support Response]
-Routed to: {state["agent_used"]}
-Response: {state["specialist_result"]}
-"""
+    final_response = (
+        f"[Customer Support Response]\n"
+        f"Routed to: {state['agent_used']}\n"
+        f"Response: {state['specialist_result']}"
+    )
 
-    state["final_response"] = final_response
-    return state
+    return {"final_response": final_response}
 
 
 # ============================================================================
@@ -460,23 +487,15 @@ def build_graph(audit: SessionAuditLog):
 # ============================================================================
 
 
-def persist_audit_log(audit: SessionAuditLog):
+def persist_audit_log(audit: SessionAuditLog) -> None:
     """Persist audit log to JSONL file."""
-    log_file = Path(__file__).parent / "audit_log.jsonl"
+    path = Path("audit_log.jsonl")
 
     try:
-        audit_dict = {
-            "session_id": audit.session_id,
-            "timestamp": datetime.now().isoformat(),
-            "total_cost_usd": audit.total_cost_usd,
-            "event_count": len(audit.events),
-            "events": audit.events,
-        }
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(audit.to_dict()) + "\n")
 
-        with open(log_file, "a") as f:
-            f.write(json.dumps(audit_dict) + "\n")
-
-        logger.info(f"Audit log persisted to {log_file}")
+        logger.info(f"Audit log persisted to {path}")
     except Exception as e:
         logger.error(f"Error persisting audit log: {e}")
 
@@ -486,58 +505,53 @@ def persist_audit_log(audit: SessionAuditLog):
 # ============================================================================
 
 
-def main():
+def main() -> None:
     """Main entry point demonstrating the multi-agent system."""
     logger.info("=" * 70)
     logger.info("Multi-Agent Customer Support System")
     logger.info("=" * 70)
 
     # Create audit session
-    session_id = str(uuid4())
-    audit = SessionAuditLog(session_id=session_id)
+    audit = SessionAuditLog(session_id="demo-session")
 
     # Build graph
     graph = build_graph(audit)
 
-    # Example requests
+    # Example requests (one orders, one subscription per assignment requirement)
     test_requests = [
-        "I need to track my recent order #12345",
-        "There's an error when I try to login to my account",
+        "My order ORD-123 is late, can I return it?",
+        "I want to upgrade from Basic to Pro. What will it cost?",
     ]
 
-    for i, request in enumerate(test_requests, 1):
-        logger.info(f"\n[TEST {i}] Request: {request}")
-
-        # Check for injection
-        is_safe, error = guard_request(request)
-        if not is_safe:
-            logger.error(error)
+    for request in test_requests:
+        # Check for injection before invoking graph
+        safe_text = guard_request(request)
+        if safe_text != request:
+            print(f"Request: {request}")
+            print(f"Blocked: {safe_text}")
+            print("---")
             continue
 
         # Initialize state
-        initial_state = MultiAgentState(
-            user_request=request,
-            route="",
-            agent_used="",
-            specialist_result="",
-            final_response="",
-        )
+        state: MultiAgentState = {
+            "user_request": safe_text,
+            "route": "general",
+            "agent_used": "",
+            "specialist_result": "",
+            "final_response": "",
+        }
 
         # Execute graph
-        final_state = graph.invoke(initial_state)
+        result = graph.invoke(state)
 
-        # Print results
-        logger.info(f"[RESULT {i}] Route: {final_state['route']}")
-        logger.info(f"[RESULT {i}] Agent: {final_state['agent_used']}")
-        logger.info(f"[RESULT {i}] Response:\n{final_state['final_response']}")
+        # Print results to stdout
+        print("Request:", request)
+        print("Route:", result.get("route"), "Agent used:", result.get("agent_used"))
+        print("Final:", result.get("final_response"))
+        print("---")
 
-    # Display audit summary
-    logger.info("\n" + "=" * 70)
-    logger.info("AUDIT SUMMARY")
-    logger.info("=" * 70)
-    logger.info(f"Session ID: {audit.session_id}")
-    logger.info(f"Total Events: {len(audit.events)}")
-    logger.info(f"Total Cost: ${audit.total_cost_usd:.8f}")
+    # Print total cost
+    print("Total cost (USD):", round(audit.total_cost_usd, 6))
 
     # Persist audit log
     persist_audit_log(audit)
@@ -547,157 +561,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-def main() -> None:
-    """
-    Main entry point for multi-agent system.
-
-    This is the skeleton for the multi-agent application.
-    Components will be implemented iteratively:
-
-    Phase 1: Agent base classes
-    Phase 2: Orchestrator framework
-    Phase 3: Memory and state management
-    Phase 4: Tool registry and integration
-    Phase 5: Communication protocols
-    Phase 6: Production monitoring
-    """
-    print("=" * 70)
-    print(" MULTI-AGENT SYSTEM - DAY 4")
-    print("=" * 70)
-
-    print("\n📋 PROJECT STATUS")
-    print("-" * 70)
-    print("Status: In Development")
-    print("Phase: 1 - Architecture Design")
-    print("Created: March 19, 2026")
-    print()
-
-    print("🎯 COMPONENTS TO BUILD")
-    print("-" * 70)
-    components = [
-        ("1. Agent Base Class", "Foundation for all agents"),
-        ("2. Orchestrator", "Multi-agent coordination"),
-        ("3. Memory System", "Shared state and knowledge"),
-        ("4. Tool Registry", "Tool integration framework"),
-        ("5. Communication", "Inter-agent messaging"),
-        ("6. Monitoring", "Production observability"),
-    ]
-
-    for component, description in components:
-        print(f"  ⏳ {component:30} - {description}")
-    print()
-
-    print("🏗️ PROJECT STRUCTURE")
-    print("-" * 70)
-    print("""
-    agentic-day4-multi-agent/
-    ├── app.py                  # Main application (this file)
-    ├── agent_base.py           # Agent base class [TODO]
-    ├── orchestrator.py         # Orchestrator [TODO]
-    ├── memory.py               # Memory system [TODO]
-    ├── tools.py                # Tool registry [TODO]
-    ├── prompts/                # Agent prompts [TODO]
-    ├── tests/                  # Test suite [TODO]
-    └── examples/               # Examples [TODO]
-    """)
-
-    print("📚 KEY PATTERNS TO IMPLEMENT")
-    print("-" * 70)
-    patterns = [
-        "Sequential Agent Execution",
-        "Parallel Agent Execution",
-        "Hierarchical Agent Organization",
-        "Peer-to-Peer Agent Network",
-        "Task Decomposition",
-        "Consensus Mechanisms",
-        "Conflict Resolution",
-        "Dynamic Agent Selection",
-    ]
-
-    for i, pattern in enumerate(patterns, 1):
-        print(f"  {i}. {pattern}")
-    print()
-
-    print("🧪 TESTING STRATEGY")
-    print("-" * 70)
-    print("""
-    Test Coverage Target: 30+ tests
-    ├── Unit Tests (15+)
-    │   ├── Agent lifecycle
-    │   ├── Task routing
-    │   ├── Memory operations
-    │   └── Tool execution
-    ├── Integration Tests (10+)
-    │   ├── Multi-agent workflows
-    │   ├── Communication patterns
-    │   └── Error scenarios
-    └── Performance Tests (5+)
-        ├── Latency
-        ├── Throughput
-        └── Resource usage
-    """)
-
-    print("📊 ARCHITECTURE LAYERS")
-    print("-" * 70)
-    layers = [
-        ("Layer 1", "Task Validation", "Verify inputs and constraints"),
-        ("Layer 2", "Agent Health", "Monitor agent status and capacity"),
-        ("Layer 3", "Resource Management", "Budget and rate limiting"),
-        ("Layer 4", "State Consistency", "Maintain coherent system state"),
-        ("Layer 5", "Error Recovery", "Handle failures and recovery"),
-        ("Layer 6", "Observability", "Logging, metrics, and monitoring"),
-    ]
-
-    for layer, name, description in layers:
-        print(f"  {layer:10} {name:25} - {description}")
-    print()
-
-    print("🚀 NEXT STEPS")
-    print("-" * 70)
-    print("""
-    1. Implement Agent base class
-       - LLM integration
-       - Tool access
-       - State management
-       - Error handling
-    
-    2. Build Orchestrator
-       - Agent lifecycle management
-       - Task routing logic
-       - Communication framework
-       - Consensus mechanisms
-    
-    3. Create Memory System
-       - Shared state storage
-       - Conversation history
-       - Knowledge base
-       - Vector storage
-    
-    4. Implement Tool Registry
-       - Tool definitions
-       - Tool execution
-       - Error handling
-       - Rate limiting
-    
-    5. Add monitoring and observability
-    
-    6. Write comprehensive tests
-    """)
-
-    print("=" * 70)
-    print(" Ready to build! 🎯")
-    print("=" * 70)
-    print()
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n\nShutdown requested by user")
-        sys.exit(0)
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
-        sys.exit(1)

@@ -107,8 +107,11 @@ class AgentHandoff:
     to_agent: str
     task: str
     context: dict
-    priority: str
+    priority: str   # "low" | "normal" | "high"
     timestamp: str
+
+    def to_prompt_context(self) -> str:
+        ...
 ```
 
 ### 5. Injection Detection
